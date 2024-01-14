@@ -65,6 +65,71 @@ impl Default for State {
 }
 
 impl Connection {
+    pub fn accept(
+        iface: &mut tun_tap::Iface,
+        iph: etherparse::Ipv4HeaderSlice,
+        tcph: etherparse::TcpHeaderSlice,
+        data: &[u8],
+    ) -> io::Result<Option<Self>> {
+        if !tcph.syn() {
+            // 只希望获得 SYN packet
+            return Ok(None);
+        }
+
+        let mut conn = Connection::default();
+        conn.state = State::SynRcvd;
+
+        // keep track of sender info
+        conn.recv.nxt = tcph.sequence_number() + 1;
+        conn.recv.wnd = tcph.window_size();
+        conn.recv.irs = tcph.sequence_number();
+
+        // decide on stuff we're sending them
+        conn.send.iss = 0;
+        conn.send.una = conn.send.iss;
+        conn.send.nxt = conn.send.una + 1;
+        conn.send.wnd = 10;
+
+        // need to start establishing a connection
+        // 先拼装tcp的包头
+        let mut syn_ack = etherparse::TcpHeader::new(
+            tcph.destination_port(), // 源端口
+            tcph.source_port(),      // 目的端口
+            conn.send.iss,           // 序列号应该是随机的，0 ~ 2**32-1
+            conn.send.wnd,           // 数据窗口大小
+        );
+        syn_ack.syn = true; // 发给客户端的 syn
+        syn_ack.ack = true; // 发给客户端的 ack
+        syn_ack.acknowledgment_number = conn.recv.nxt;
+
+        // 拼装ip包头
+        let mut ip = etherparse::Ipv4Header::new(
+            syn_ack.header_len(),
+            64,
+            etherparse::IpNumber::Tcp as _,
+            iph.destination(),
+            iph.source(),
+        );
+
+        // 检验和
+        syn_ack.checksum = syn_ack
+            .calc_checksum_ipv4(&ip, &[])
+            .expect("failed to compute checksum");
+
+        let mut buf = [0u8; 1500];
+        // write out the headers
+        let unwritten = {
+            let mut unwritten = &mut buf[..];
+            let _ = ip.write(&mut unwritten);
+            let _ = syn_ack.write(&mut unwritten);
+            unwritten.len()
+        };
+
+        iface.send(&buf[..buf.len() - unwritten])?;
+
+        Ok(Some(conn))
+    }
+
     pub fn on_packet(
         &mut self,
         iface: &mut Iface,
@@ -72,64 +137,11 @@ impl Connection {
         tcph: etherparse::TcpHeaderSlice,
         data: &[u8],
     ) -> io::Result<usize> {
-        let mut buf = [0u8; 1500];
         match self.state {
             State::Closed => {
                 return Ok(0);
             }
-            State::Listen => {
-                if !tcph.syn() {
-                    // 只希望获得 SYN packet
-                    return Ok(0);
-                }
-
-                // keep track of sender info
-                self.recv.nxt = tcph.sequence_number() + 1;
-                self.recv.wnd = tcph.window_size();
-                self.recv.irs = tcph.sequence_number();
-
-                // decide on stuff we're sending them
-                self.send.iss = 0;
-                self.send.una = self.send.iss;
-                self.send.nxt = self.send.una + 1;
-                self.send.wnd = 10;
-
-                // need to start establishing a connection
-                // 先拼装tcp的包头
-                let mut syn_ack = etherparse::TcpHeader::new(
-                    tcph.destination_port(), // 源端口
-                    tcph.source_port(),      // 目的端口
-                    self.send.iss,           // 序列号应该是随机的，0 ~ 2**32-1
-                    self.send.wnd,           // 数据窗口大小
-                );
-                syn_ack.syn = true; // 发给客户端的 syn
-                syn_ack.ack = true; // 发给客户端的 ack
-                syn_ack.acknowledgment_number = self.recv.nxt;
-
-                // 拼装ip包头
-                let mut ip = etherparse::Ipv4Header::new(
-                    syn_ack.header_len(),
-                    64,
-                    etherparse::IpNumber::Tcp as _,
-                    iph.destination(),
-                    iph.source(),
-                );
-
-                // 检验和
-                syn_ack.checksum = syn_ack
-                    .calc_checksum_ipv4(&ip, &[])
-                    .expect("failed to compute checksum");
-
-                // write out the headers
-                let unwritten = {
-                    let mut unwritten = &mut buf[..];
-                    let _ = ip.write(&mut unwritten);
-                    let _ = syn_ack.write(&mut unwritten);
-                    unwritten.len()
-                };
-
-                iface.send(&buf[..buf.len() - unwritten])?;
-            }
+            State::Listen => {}
             _ => {}
         }
 

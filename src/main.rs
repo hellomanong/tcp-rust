@@ -1,4 +1,8 @@
-use std::{collections::HashMap, io, net::Ipv4Addr};
+use std::{
+    collections::{hash_map::Entry, HashMap},
+    io,
+    net::Ipv4Addr,
+};
 
 use etherparse::Ipv4HeaderSlice;
 use tcp::Connection;
@@ -46,13 +50,26 @@ fn main() -> io::Result<()> {
                     Ok(tcph) => {
                         // 从数据包的开头到tcp头结束
                         let datai = iph.slice().len() + tcph.slice().len();
-                        connections
-                            .entry(Quad {
-                                src: (src, tcph.source_port()),
-                                dst: (dst, tcph.destination_port()),
-                            })
-                            .or_default()
-                            .on_packet(&mut iface, iph, tcph, &buf[datai..nbytes])?;
+                        match connections.entry(Quad {
+                            src: (src, tcph.source_port()),
+                            dst: (dst, tcph.destination_port()),
+                        }) {
+                            Entry::Occupied(mut v) => {
+                                v.get_mut().on_packet(
+                                    &mut iface,
+                                    iph,
+                                    tcph,
+                                    &buf[datai..nbytes],
+                                )?;
+                            }
+                            Entry::Vacant(v) => {
+                                if let Some(c) =
+                                    Connection::accept(&mut iface, iph, tcph, &buf[datai..nbytes])?
+                                {
+                                    v.insert(c);
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("ignoring weird tcp packet {:?}", e);
