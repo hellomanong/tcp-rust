@@ -163,21 +163,25 @@ impl Connection {
 
         let ackn = tcph.acknowledgment_number();
 
-        match self.send.una.cmp(&ackn) {
-            Equal => return Ok(()),
-            Less => {
-                // U<A 的情況下，N在中间是错的，在两头没事
-                if self.send.nxt >= self.send.una && self.send.nxt < ackn {
-                    return Ok(());
-                }
-            }
-            Greater => {
-                // N在中间没事
-                if self.send.nxt >= ackn && self.send.nxt < self.send.una {
-                } else {
-                    return Ok(());
-                }
-            }
+        // match self.send.una.cmp(&ackn) {
+        //     Equal => return Ok(()),
+        //     Less => {
+        //         // U<A 的情況下，N在中间是错的，在两头没事
+        //         if self.send.nxt >= self.send.una && self.send.nxt < ackn {
+        //             return Ok(());
+        //         }
+        //     }
+        //     Greater => {
+        //         // N在中间没事
+        //         if self.send.nxt >= ackn && self.send.nxt < self.send.una {
+        //         } else {
+        //             return Ok(());
+        //         }
+        //     }
+        // }
+
+        if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+            return Ok(());
         }
 
         // RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND , RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
@@ -198,29 +202,38 @@ impl Connection {
         // |--S--------|-----------------------------------------------|------>|
 
         let seqn = tcph.sequence_number();
-        match self.recv.nxt.cmp(&seqn) {
-            Equal => {
-                if self.recv.nxt.wrapping_add(self.recv.wnd as _) == seqn {
-                    return Ok(());
-                };
-            }
-            Less => {
-                // N<S 的情况下，W在中间是错误的，在两头没事
-                if self.recv.nxt.wrapping_add(self.recv.wnd as _) >= self.recv.nxt
-                    && self.recv.nxt.wrapping_add(self.recv.wnd as _) <= seqn
-                {
-                    return Ok(());
-                }
-            }
-            Greater => {
-                // W在中间没事
-                if self.recv.nxt.wrapping_add(self.recv.wnd as _) > seqn
-                    && self.recv.nxt.wrapping_add(self.recv.wnd as _) < self.recv.nxt
-                {
-                } else {
-                    return Ok(());
-                }
-            }
+        // match self.recv.nxt.cmp(&seqn) {
+        //     Equal => {
+        //         if self.recv.nxt.wrapping_add(self.recv.wnd) == seqn {
+        //             return Ok(());
+        //         };
+        //     }
+        //     Less => {
+        //         // N<S 的情况下，W在中间是错误的，在两头没事
+        //         if self.recv.nxt.wrapping_add(self.recv.wnd) >= self.recv.nxt
+        //             && self.recv.nxt.wrapping_add(self.recv.wnd) <= seqn
+        //         {
+        //             return Ok(());
+        //         }
+        //     }
+        //     Greater => {
+        //         // W在中间没事
+        //         if self.recv.nxt.wrapping_add(self.recv.wnd) > seqn
+        //             && self.recv.nxt.wrapping_add(self.recv.wnd) < self.recv.nxt
+        //         {
+        //         } else {
+        //             return Ok(());
+        //         }
+        //     }
+        // }
+
+        // or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+
+        let wend = self.recv.nxt.wrapping_add(self.recv.wnd as _);
+        if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
+            && !is_between_wrapped(self.recv.nxt, seqn + data.len() as u32 - 1, wend)
+        {
+            return Ok(());
         }
 
         match self.state {
@@ -242,4 +255,27 @@ impl Connection {
 
         Ok(())
     }
+}
+
+// 改成统一的 start < x < end
+// 省略 = 的判断， 在调用处，+1或者 -1 来处理
+fn is_between_wrapped(start: u32, x: u32, end: u32) -> bool {
+    match start.cmp(&x) {
+        Equal => return false,
+        Less => {
+            // start < x 的情况下，end在中间是错误的，在两头没事
+            if end >= start && end <= x {
+                return false;
+            };
+        }
+        Greater => {
+            // end在中间没事  x < end < start
+            if end > x && end < start {
+            } else {
+                return false;
+            };
+        }
+    }
+
+    true
 }
