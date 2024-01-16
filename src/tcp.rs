@@ -195,23 +195,27 @@ impl Connection {
         // 0-----------W                                               N-------0
         // |-----------|-----------------------------------------------|---S-->|
         // 0-----------W                                               N-------0
-        // |--S--------|------------------------------------------ ----|------>|
+        // |--S--------|-----------------------------------------------|------>|
 
         let seqn = tcph.sequence_number();
-        match self.send.nxt.cmp(&seqn) {
-            Equal => {}
+        match self.recv.nxt.cmp(&seqn) {
+            Equal => {
+                if self.recv.nxt.wrapping_add(self.recv.wnd as _) == seqn {
+                    return Ok(());
+                };
+            }
             Less => {
                 // N<S 的情况下，W在中间是错误的，在两头没事
-                if self.send.nxt.wrapping_add(self.send.wnd) >= self.send.nxt
-                    && self.send.nxt.wrapping_add(self.send.wnd) <= seqn
+                if self.recv.nxt.wrapping_add(self.recv.wnd as _) >= self.recv.nxt
+                    && self.recv.nxt.wrapping_add(self.recv.wnd as _) <= seqn
                 {
                     return Ok(());
                 }
             }
             Greater => {
                 // W在中间没事
-                if self.send.nxt.wrapping_add(self.send.wnd) > seqn
-                    && self.send.nxt.wrapping_add(self.send.wnd) < self.send.nxt
+                if self.recv.nxt.wrapping_add(self.recv.wnd as _) > seqn
+                    && self.recv.nxt.wrapping_add(self.recv.wnd as _) < self.recv.nxt
                 {
                 } else {
                     return Ok(());
