@@ -1,15 +1,21 @@
-use std::cmp::Ordering::*;
-use std::io;
-use std::ops::Add;
-
+use std::cmp::{min, Ordering::*};
+use std::io::{self, Write};
+use std::usize::MIN;
 use tun_tap::Iface;
 
 #[derive(Debug)]
 pub enum State {
-    Closed,
-    Listen,
     SynRcvd,
-    Esta,
+    Estab,
+}
+
+impl State {
+    fn is_synchronized(&self) -> bool {
+        match *self {
+            State::SynRcvd => false,
+            State::Estab => true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -18,6 +24,7 @@ pub struct Connection {
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
     ip: etherparse::Ipv4Header,
+    tcp: etherparse::TcpHeader,
 }
 
 /// State Of Send Sequence Space (RFC 793 s3.2 F5)  发送序列空间
@@ -63,7 +70,7 @@ struct RecvSequenceSpace {
 
 impl Default for State {
     fn default() -> Self {
-        State::Listen
+        State::SynRcvd
     }
 }
 
@@ -104,6 +111,7 @@ impl Connection {
         syn_ack.syn = true; // 发给客户端的 syn
         syn_ack.ack = true; // 发给客户端的 ack
         syn_ack.acknowledgment_number = conn.recv.nxt;
+
         // 拼装ip包头
         conn.ip = etherparse::Ipv4Header::new(
             syn_ack.header_len(),
@@ -112,7 +120,6 @@ impl Connection {
             iph.destination(),
             iph.source(),
         );
-
         conn.ip.set_payload_len(syn_ack.header_len() as _);
 
         // 检验和
@@ -120,18 +127,60 @@ impl Connection {
             .calc_checksum_ipv4(&conn.ip, &[])
             .expect("failed to compute checksum");
 
-        let mut buf = [0u8; 1500];
-        // write out the headers
-        let unwritten = {
-            let mut unwritten = &mut buf[..];
-            let _ = conn.ip.write(&mut unwritten);
-            let _ = syn_ack.write(&mut unwritten);
-            unwritten.len()
-        };
+        conn.tcp = syn_ack;
 
-        iface.send(&buf[..buf.len() - unwritten])?;
+        conn.write(iface, &[])?;
 
         Ok(Some(conn))
+    }
+
+    pub fn send_rst(&mut self, iface: &mut Iface) -> io::Result<()> {
+        self.tcp.rst = true;
+        self.tcp.sequence_number = 0;
+        self.tcp.acknowledgment_number = 0;
+        self.ip.set_payload_len(self.tcp.header_len() as _);
+        self.write(iface, &[])?;
+        Ok(())
+    }
+
+    pub fn write(&mut self, iface: &mut Iface, payload: &[u8]) -> io::Result<usize> {
+        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.acknowledgment_number = self.recv.nxt;
+        self.ip
+            .set_payload_len(self.tcp.header_len() as usize + payload.len());
+
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &[])
+            .expect("failed to compute checksum");
+
+        let mut buf = [0u8; 1500];
+        // let size = min(
+        //     buf.len(),
+        //     self.ip.header_len() + self.tcp.header_len() as usize + payload.len(),
+        // );
+
+        let mut unwritten = buf.as_mut_slice();
+        let _ = self.ip.write(&mut unwritten);
+        let _ = self.tcp.write(&mut unwritten);
+        let payload_bytes = unwritten.write(payload)?;
+
+        let unwritten = unwritten.len(); // 剩余的空间
+        iface.send(&buf[..buf.len() - unwritten])?;
+
+        self.send.nxt = self.send.nxt.wrapping_add(payload_bytes as u32);
+
+        if self.tcp.syn {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.syn = false;
+        }
+
+        if self.tcp.fin {
+            self.send.nxt = self.send.nxt.wrapping_add(1);
+            self.tcp.fin = false;
+        }
+
+        Ok(payload_bytes)
     }
 
     pub fn on_packet(
@@ -162,24 +211,6 @@ impl Connection {
         // |--N----------------------------------------------------------U--A-->|
 
         let ackn = tcph.acknowledgment_number();
-
-        // match self.send.una.cmp(&ackn) {
-        //     Equal => return Ok(()),
-        //     Less => {
-        //         // U<A 的情況下，N在中间是错的，在两头没事
-        //         if self.send.nxt >= self.send.una && self.send.nxt < ackn {
-        //             return Ok(());
-        //         }
-        //     }
-        //     Greater => {
-        //         // N在中间没事
-        //         if self.send.nxt >= ackn && self.send.nxt < self.send.una {
-        //         } else {
-        //             return Ok(());
-        //         }
-        //     }
-        // }
-
         if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
             return Ok(());
         }
@@ -202,45 +233,42 @@ impl Connection {
         // |--S--------|-----------------------------------------------|------>|
 
         let seqn = tcph.sequence_number();
-        // match self.recv.nxt.cmp(&seqn) {
-        //     Equal => {
-        //         if self.recv.nxt.wrapping_add(self.recv.wnd) == seqn {
-        //             return Ok(());
-        //         };
-        //     }
-        //     Less => {
-        //         // N<S 的情况下，W在中间是错误的，在两头没事
-        //         if self.recv.nxt.wrapping_add(self.recv.wnd) >= self.recv.nxt
-        //             && self.recv.nxt.wrapping_add(self.recv.wnd) <= seqn
-        //         {
-        //             return Ok(());
-        //         }
-        //     }
-        //     Greater => {
-        //         // W在中间没事
-        //         if self.recv.nxt.wrapping_add(self.recv.wnd) > seqn
-        //             && self.recv.nxt.wrapping_add(self.recv.wnd) < self.recv.nxt
-        //         {
-        //         } else {
-        //             return Ok(());
-        //         }
-        //     }
-        // }
 
         // or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
-
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as _);
-        if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
-            && !is_between_wrapped(self.recv.nxt, seqn + data.len() as u32 - 1, wend)
-        {
-            return Ok(());
+        let mut slen = data.len() as u32;
+
+        // 只有SYN和FIN，即使有效载荷为零，也会占用一个序列号号，必须设置SEG.LEN = 1
+        // SEG.LEN 是有效载荷长度，也就是tcp段除去，header后的数据长度
+        if tcph.syn() || tcph.fin() {
+            slen += 1;
+        }
+
+        if data.len() == 0 {
+            if self.recv.wnd == 0 {
+                if seqn != self.recv.nxt {
+                    return Ok(());
+                }
+            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
+                return Ok(());
+            }
+        } else {
+            if self.recv.wnd == 0 {
+                return Ok(());
+            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
+                && !is_between_wrapped(self.recv.nxt, seqn.wrapping_add(slen - 1), wend)
+            {
+                return Ok(());
+            }
         }
 
         match self.state {
-            State::Closed => {
-                return Ok(());
+            State::SynRcvd => {
+                if !tcph.ack() {
+                    return Ok(());
+                }
             }
-            State::Listen => {}
+            State::Estab => {}
             _ => {}
         }
 
